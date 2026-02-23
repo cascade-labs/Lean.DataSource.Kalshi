@@ -1,0 +1,527 @@
+/*
+ * Kalshi REST API Client
+ * HTTP client with RSA PSS signature authentication
+ */
+
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
+using System.Text;
+using Newtonsoft.Json;
+using QuantConnect.Util;
+using QuantConnect.Logging;
+using QuantConnect.Configuration;
+using QuantConnect.Lean.DataSource.KalshiData.Models;
+
+namespace QuantConnect.Lean.DataSource.KalshiData
+{
+    /// <summary>
+    /// REST client for Kalshi API with RSA PSS signature authentication
+    /// </summary>
+    public class KalshiDataRestClient : IDisposable
+    {
+        private const string ApiBaseUrl = "https://api.elections.kalshi.com";
+        private const string ApiPath = "/trade-api/v2";
+        private const int MaxRetries = 3;
+        private const int BaseRetryDelayMs = 1000;
+
+        private readonly string _apiKey;
+        private readonly string _privateKeyPem;
+        private readonly HttpClient _httpClient;
+        private readonly RateGate _rateGate;
+        private readonly ConcurrentDictionary<string, KalshiMarket> _marketCache = new();
+        private readonly ConcurrentDictionary<string, List<KalshiCandlestick>> _candlestickCache = new();
+        private readonly ConcurrentDictionary<string, object> _timeRangeFetchLocks = new();
+        private bool _disposed;
+
+        /// <summary>
+        /// Initializes a new Kalshi REST client with RSA PSS authentication
+        /// </summary>
+        /// <param name="rateGate">Rate limiter for API requests</param>
+        public KalshiDataRestClient(RateGate rateGate)
+        {
+            _apiKey = Config.Get("kalshi-api-key", string.Empty);
+            var privateKeyBase64 = Config.Get("kalshi-private-key", string.Empty);
+
+            if (string.IsNullOrEmpty(_apiKey))
+            {
+                throw new InvalidOperationException("kalshi-api-key configuration is required");
+            }
+
+            if (string.IsNullOrEmpty(privateKeyBase64))
+            {
+                throw new InvalidOperationException("kalshi-private-key configuration is required");
+            }
+
+            // Decode base64 PEM content
+            try
+            {
+                _privateKeyPem = Encoding.UTF8.GetString(Convert.FromBase64String(privateKeyBase64));
+            }
+            catch (FormatException ex)
+            {
+                throw new InvalidOperationException("kalshi-private-key must be base64 encoded PEM content", ex);
+            }
+
+            _httpClient = new HttpClient
+            {
+                BaseAddress = new Uri(ApiBaseUrl),
+                Timeout = TimeSpan.FromMinutes(2)
+            };
+
+            _rateGate = rateGate;
+
+            Log.Trace($"KalshiDataRestClient: Initialized with API key {_apiKey[..Math.Min(8, _apiKey.Length)]}...");
+        }
+
+        /// <summary>
+        /// Create RSA PSS signature for request authentication
+        /// </summary>
+        private string CreateSignature(string method, string path, long timestampMs)
+        {
+            // Message format: {timestamp_ms}{METHOD}/trade-api/v2{path}
+            // Note: path should not include query string for signature
+            var pathWithoutQuery = path.Split('?')[0];
+            var message = $"{timestampMs}{method}{ApiPath}{pathWithoutQuery}";
+
+            using var rsa = RSA.Create();
+            rsa.ImportFromPem(_privateKeyPem);
+
+            var signature = rsa.SignData(
+                Encoding.UTF8.GetBytes(message),
+                HashAlgorithmName.SHA256,
+                RSASignaturePadding.Pss);
+
+            return Convert.ToBase64String(signature);
+        }
+
+        /// <summary>
+        /// Add authentication headers to request
+        /// </summary>
+        private void AddAuthHeaders(HttpRequestMessage request, string method, string path)
+        {
+            var timestampMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var signature = CreateSignature(method, path, timestampMs);
+
+            request.Headers.Add("KALSHI-ACCESS-KEY", _apiKey);
+            request.Headers.Add("KALSHI-ACCESS-SIGNATURE", signature);
+            request.Headers.Add("KALSHI-ACCESS-TIMESTAMP", timestampMs.ToString());
+        }
+
+        /// <summary>
+        /// Execute a GET request with authentication and retry logic
+        /// </summary>
+        public async Task<T?> GetAsync<T>(string path) where T : class
+        {
+            var retryCount = 0;
+
+            while (retryCount < MaxRetries)
+            {
+                _rateGate.WaitToProceed();
+
+                try
+                {
+                    var request = new HttpRequestMessage(HttpMethod.Get, $"{ApiPath}{path}");
+                    AddAuthHeaders(request, "GET", path);
+
+                    Log.Debug($"KalshiDataRestClient: GET {path}");
+
+                    var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+
+                    if (response.StatusCode == System.Net.HttpStatusCode.TooManyRequests)
+                    {
+                        // Rate limited - wait and retry with exponential backoff
+                        retryCount++;
+                        var delay = BaseRetryDelayMs * (int)Math.Pow(2, retryCount);
+                        Log.Trace($"KalshiDataRestClient: Rate limited (429), waiting {delay}ms before retry {retryCount}/{MaxRetries}");
+                        await Task.Delay(delay).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                    {
+                        Log.Debug($"KalshiDataRestClient: Not found (404) for {path}");
+                        return null;
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var errorContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        Log.Error($"KalshiDataRestClient: Request failed with {response.StatusCode}: {errorContent}");
+
+                        if ((int)response.StatusCode >= 500)
+                        {
+                            // Server error - retry
+                            retryCount++;
+                            var delay = BaseRetryDelayMs * (int)Math.Pow(2, retryCount);
+                            await Task.Delay(delay).ConfigureAwait(false);
+                            continue;
+                        }
+
+                        return null;
+                    }
+
+                    var content = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    return JsonConvert.DeserializeObject<T>(content);
+                }
+                catch (HttpRequestException ex)
+                {
+                    Log.Error($"KalshiDataRestClient: HTTP error for {path}: {ex.Message}");
+                    retryCount++;
+                    if (retryCount < MaxRetries)
+                    {
+                        var delay = BaseRetryDelayMs * (int)Math.Pow(2, retryCount);
+                        await Task.Delay(delay).ConfigureAwait(false);
+                    }
+                }
+                catch (TaskCanceledException ex)
+                {
+                    Log.Error($"KalshiDataRestClient: Request timeout for {path}: {ex.Message}");
+                    return null;
+                }
+            }
+
+            Log.Error($"KalshiDataRestClient: Max retries exceeded for {path}");
+            return null;
+        }
+
+        #region Market Operations
+
+        /// <summary>
+        /// Get a single market by ticker
+        /// </summary>
+        public async Task<KalshiMarket?> GetMarketAsync(string ticker)
+        {
+            // Check cache first
+            if (_marketCache.TryGetValue(ticker, out var cached))
+            {
+                return cached;
+            }
+
+            var response = await GetAsync<KalshiMarketResponse>($"/markets/{ticker}").ConfigureAwait(false);
+            if (response?.Market != null)
+            {
+                _marketCache[ticker] = response.Market;
+            }
+            return response?.Market;
+        }
+
+        /// <summary>
+        /// Get a single market by ticker (synchronous)
+        /// </summary>
+        public KalshiMarket? GetMarket(string ticker)
+        {
+            return GetMarketAsync(ticker).GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Get all markets with optional filtering
+        /// </summary>
+        /// <param name="status">Filter by status: open, closed, settled</param>
+        /// <param name="seriesTicker">Filter by series ticker</param>
+        /// <param name="eventTicker">Filter by event ticker</param>
+        /// <param name="minCloseTs">Minimum close timestamp (Unix seconds)</param>
+        /// <param name="maxCloseTs">Maximum close timestamp (Unix seconds)</param>
+        public async Task<List<KalshiMarket>> GetMarketsAsync(
+            string? status = null,
+            string? seriesTicker = null,
+            string? eventTicker = null,
+            long? minCloseTs = null,
+            long? maxCloseTs = null)
+        {
+            var allMarkets = new List<KalshiMarket>();
+            string? cursor = null;
+
+            do
+            {
+                var path = "/markets?limit=1000";
+                if (!string.IsNullOrEmpty(status))
+                {
+                    path += $"&status={status}";
+                }
+                if (!string.IsNullOrEmpty(seriesTicker))
+                {
+                    path += $"&series_ticker={seriesTicker}";
+                }
+                if (!string.IsNullOrEmpty(eventTicker))
+                {
+                    path += $"&event_ticker={eventTicker}";
+                }
+                if (minCloseTs.HasValue)
+                {
+                    path += $"&min_close_ts={minCloseTs.Value}";
+                }
+                if (maxCloseTs.HasValue)
+                {
+                    path += $"&max_close_ts={maxCloseTs.Value}";
+                }
+                if (!string.IsNullOrEmpty(cursor))
+                {
+                    path += $"&cursor={cursor}";
+                }
+
+                var response = await GetAsync<KalshiMarketsResponse>(path).ConfigureAwait(false);
+                if (response == null)
+                {
+                    break;
+                }
+
+                allMarkets.AddRange(response.Markets);
+
+                // Cache markets
+                foreach (var market in response.Markets)
+                {
+                    _marketCache[market.Ticker] = market;
+                }
+
+                cursor = response.Cursor;
+            }
+            while (!string.IsNullOrEmpty(cursor));
+
+            return allMarkets;
+        }
+
+        /// <summary>
+        /// Get all markets (synchronous)
+        /// </summary>
+        public List<KalshiMarket> GetMarkets(
+            string? status = null,
+            string? seriesTicker = null,
+            string? eventTicker = null,
+            long? minCloseTs = null,
+            long? maxCloseTs = null)
+        {
+            return GetMarketsAsync(status, seriesTicker, eventTicker, minCloseTs, maxCloseTs)
+                .GetAwaiter().GetResult();
+        }
+
+        #endregion
+
+        #region Candlestick Operations
+
+        /// <summary>
+        /// Build a cache key for candlestick lookups
+        /// </summary>
+        private static string CandleCacheKey(string ticker, long startTs, long endTs)
+        {
+            return $"{ticker}|{startTs}|{endTs}";
+        }
+
+        /// <summary>
+        /// Get candlestick data for a single market, using the batch endpoint.
+        /// On first call for a given time range, pre-fetches candlesticks for ALL
+        /// known market tickers (from market cache) and caches the results.
+        /// Subsequent calls for the same time range are served from cache.
+        /// </summary>
+        public IEnumerable<KalshiCandlestick> GetCandlesticks(
+            string marketTicker,
+            DateTime startDate,
+            DateTime endDate,
+            int periodInterval = 1,
+            int chunkDays = 3)
+        {
+            foreach (var (rangeStart, rangeEnd) in KalshiExtensions.GenerateDateRanges(startDate, endDate, chunkDays))
+            {
+                var startTs = rangeStart.ToUnixSeconds(KalshiExtensions.KalshiTimeZone);
+                var endTs = rangeEnd.ToUnixSeconds(KalshiExtensions.KalshiTimeZone);
+
+                var cacheKey = CandleCacheKey(marketTicker, startTs, endTs);
+
+                if (!_candlestickCache.TryGetValue(cacheKey, out var candles))
+                {
+                    // Use per-time-range lock to prevent duplicate pre-fetches
+                    // when multiple threads request data for the same time range concurrently.
+                    // Follows the double-checked locking pattern used by ThetaData/Polygon providers.
+                    var rangeKey = $"{startTs}|{endTs}";
+                    var lockObj = _timeRangeFetchLocks.GetOrAdd(rangeKey, _ => new object());
+                    lock (lockObj)
+                    {
+                        // Double-check: another thread may have cached our ticker during its pre-fetch
+                        if (!_candlestickCache.TryGetValue(cacheKey, out candles))
+                        {
+                            PreFetchCandlesticks(marketTicker, startTs, endTs, periodInterval);
+                            _candlestickCache.TryGetValue(cacheKey, out candles);
+                        }
+                    }
+                }
+
+                if (candles != null)
+                {
+                    foreach (var candle in candles)
+                    {
+                        yield return candle;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Pre-fetch candlesticks for all known market tickers (from market cache)
+        /// for a given time range, plus the requested ticker. Results are stored
+        /// in the candlestick cache.
+        /// </summary>
+        private void PreFetchCandlesticks(string requestedTicker, long startTs, long endTs, int periodInterval)
+        {
+            // Collect all tickers from market cache + the requested one,
+            // but skip tickers that are already cached for this time range
+            var allTickers = new HashSet<string>(_marketCache.Keys) { requestedTicker };
+            var tickersToFetch = allTickers
+                .Where(t => !_candlestickCache.ContainsKey(CandleCacheKey(t, startTs, endTs)))
+                .ToArray();
+
+            if (tickersToFetch.Length == 0)
+            {
+                return;
+            }
+
+            Log.Trace($"KalshiDataRestClient: Pre-fetching candlesticks for {tickersToFetch.Length} tickers, " +
+                      $"ts={startTs}-{endTs}");
+
+            var batchResult = GetBatchCandlesticksAsync(tickersToFetch, startTs, endTs, periodInterval)
+                .GetAwaiter().GetResult();
+
+            // Cache all results (including empty ones to avoid re-fetching)
+            foreach (var ticker in tickersToFetch)
+            {
+                var cacheKey = CandleCacheKey(ticker, startTs, endTs);
+                batchResult.TryGetValue(ticker, out var candles);
+                _candlestickCache[cacheKey] = candles ?? new List<KalshiCandlestick>();
+            }
+        }
+
+        /// <summary>
+        /// Get candlestick data for multiple markets in a single batch request.
+        /// Uses GET /markets/candlesticks which accepts up to 100 tickers per request.
+        /// No series_ticker needed (unlike the single-market endpoint).
+        /// </summary>
+        public async Task<Dictionary<string, List<KalshiCandlestick>>> GetBatchCandlesticksAsync(
+            string[] marketTickers,
+            long startTs,
+            long endTs,
+            int periodInterval = 1)
+        {
+            var result = new Dictionary<string, List<KalshiCandlestick>>();
+
+            // Chunk into groups of 100 (API limit)
+            const int chunkSize = 100;
+            for (var i = 0; i < marketTickers.Length; i += chunkSize)
+            {
+                var chunk = marketTickers.Skip(i).Take(chunkSize).ToArray();
+                var tickersCsv = string.Join(",", chunk);
+
+                var path = $"/markets/candlesticks?market_tickers={tickersCsv}" +
+                           $"&start_ts={startTs}&end_ts={endTs}&period_interval={periodInterval}";
+
+                Log.Trace($"KalshiDataRestClient: Batch candlesticks for {chunk.Length} tickers, " +
+                          $"ts={startTs}-{endTs}, first={chunk[0]}");
+
+                var response = await GetAsync<BatchGetMarketCandlesticksResponse>(path).ConfigureAwait(false);
+                if (response?.Markets != null)
+                {
+                    var totalCandles = 0;
+                    foreach (var marketData in response.Markets)
+                    {
+                        result[marketData.MarketTicker] = marketData.Candlesticks;
+                        totalCandles += marketData.Candlesticks.Count;
+                    }
+                    Log.Trace($"KalshiDataRestClient: Batch response: {response.Markets.Count} markets, {totalCandles} total candlesticks");
+                }
+            }
+
+            return result;
+        }
+
+        #endregion
+
+        #region Events and Series Operations
+
+        /// <summary>
+        /// Get all events with optional filtering
+        /// </summary>
+        public async Task<List<KalshiEvent>> GetEventsAsync(
+            string? status = null,
+            string? seriesTicker = null)
+        {
+            var allEvents = new List<KalshiEvent>();
+            string? cursor = null;
+
+            do
+            {
+                var path = "/events?limit=200";
+                if (!string.IsNullOrEmpty(status))
+                {
+                    path += $"&status={status}";
+                }
+                if (!string.IsNullOrEmpty(seriesTicker))
+                {
+                    path += $"&series_ticker={seriesTicker}";
+                }
+                if (!string.IsNullOrEmpty(cursor))
+                {
+                    path += $"&cursor={cursor}";
+                }
+
+                var response = await GetAsync<KalshiEventsResponse>(path).ConfigureAwait(false);
+                if (response == null)
+                {
+                    break;
+                }
+
+                allEvents.AddRange(response.Events);
+                cursor = response.Cursor;
+            }
+            while (!string.IsNullOrEmpty(cursor));
+
+            return allEvents;
+        }
+
+        /// <summary>
+        /// Get all series
+        /// </summary>
+        public async Task<List<KalshiSeries>> GetSeriesAsync()
+        {
+            var allSeries = new List<KalshiSeries>();
+            string? cursor = null;
+
+            do
+            {
+                var path = "/series?limit=200";
+                if (!string.IsNullOrEmpty(cursor))
+                {
+                    path += $"&cursor={cursor}";
+                }
+
+                var response = await GetAsync<KalshiSeriesResponse>(path).ConfigureAwait(false);
+                if (response == null)
+                {
+                    break;
+                }
+
+                allSeries.AddRange(response.Series);
+                cursor = response.Cursor;
+            }
+            while (!string.IsNullOrEmpty(cursor));
+
+            return allSeries;
+        }
+
+        #endregion
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (!_disposed)
+            {
+                if (disposing)
+                {
+                    _httpClient?.Dispose();
+                }
+                _disposed = true;
+            }
+        }
+    }
+}
