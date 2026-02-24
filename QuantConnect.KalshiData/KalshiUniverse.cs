@@ -99,7 +99,9 @@ namespace QuantConnect.Lean.DataSource.KalshiData
         }
 
         /// <summary>
-        /// Check if a market was open (tradeable) at a given time
+        /// Check if a market's trading window overlaps the given day.
+        /// This ensures short-lived contracts (e.g. 15-minute markets) are included
+        /// even when the universe evaluates once per day at midnight.
         /// </summary>
         private static bool IsMarketOpenAt(KalshiMarket market, DateTime localTime)
         {
@@ -111,7 +113,10 @@ namespace QuantConnect.Lean.DataSource.KalshiData
                 return false;
             }
 
-            return openTime.Value <= localTime && closeTime.Value >= localTime;
+            // Include any market whose open-close window overlaps with the current day
+            var dayStart = localTime.Date;
+            var dayEnd = dayStart.AddDays(1);
+            return openTime.Value < dayEnd && closeTime.Value >= dayStart;
         }
 
         /// <summary>
