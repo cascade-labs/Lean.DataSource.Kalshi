@@ -163,6 +163,21 @@ namespace QuantConnect.Brokerages.Kalshi
                 return false;
             }
 
+            // Prediction market tokens are long-only — reject sell orders that would create short positions
+            if (order.Direction == OrderDirection.Sell)
+            {
+                var holdings = security.Holdings.Quantity;
+                if (Math.Abs(order.Quantity) > holdings)
+                {
+                    message = new BrokerageMessageEvent(
+                        BrokerageMessageType.Warning,
+                        "ShortNotAllowed",
+                        $"Prediction market tokens are long-only. Cannot sell {Math.Abs(order.Quantity)} contracts " +
+                        $"when holding {holdings}. To take a bearish position, buy the NO token.");
+                    return false;
+                }
+            }
+
             return base.CanSubmitOrder(security, order, out message);
         }
 

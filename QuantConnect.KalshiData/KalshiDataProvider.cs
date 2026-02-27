@@ -57,6 +57,21 @@ namespace QuantConnect.Lean.DataSource.KalshiData
         /// </summary>
         public KalshiDataRestClient? RestClient => _restApiClient;
 
+        /// <summary>
+        /// Access to the symbol mapper for token symbol creation
+        /// </summary>
+        public KalshiSymbolMapper SymbolMapper
+        {
+            get
+            {
+                if (_symbolMapper == null)
+                {
+                    throw new InvalidOperationException("Provider not initialized");
+                }
+                return _symbolMapper;
+            }
+        }
+
         public KalshiDataProvider()
         {
             Initialize();
@@ -209,15 +224,19 @@ namespace QuantConnect.Lean.DataSource.KalshiData
             Resolution resolution)
         {
             var period = resolution.ToTimeSpan();
+            var isNoToken = symbol.IsNoToken;
 
-            foreach (var candle in _restApiClient!.GetCandlesticks(marketTicker, startTimeLocal, endTimeLocal))
+            // Always fetch using the base YES ticker from the API
+            var apiTicker = symbol.BaseTicker;
+
+            foreach (var candle in _restApiClient!.GetCandlesticks(apiTicker, startTimeLocal, endTimeLocal))
             {
                 // IMPORTANT: Do NOT skip any candles!
                 // We must emit every bar (even with 0 values for invalid/illiquid sides)
                 // to prevent LEAN's fill-forward from injecting stale prices.
-                // ToQuoteBar handles setting Bar(0,0,0,0) for invalid/illiquid data.
-                var quoteBar = candle.ToQuoteBar(symbol, period, KalshiTimeZone);
-                yield return quoteBar;
+                yield return isNoToken
+                    ? candle.ToNoQuoteBar(symbol, period, KalshiTimeZone)
+                    : candle.ToQuoteBar(symbol, period, KalshiTimeZone);
             }
         }
 
@@ -327,7 +346,7 @@ namespace QuantConnect.Lean.DataSource.KalshiData
         }
 
         /// <summary>
-        /// Convert a Kalshi market ticker to a LEAN Symbol
+        /// Convert a Kalshi market ticker to a LEAN Symbol (YES token, backward compatible)
         /// </summary>
         public Symbol CreateSymbol(string ticker)
         {
@@ -337,6 +356,19 @@ namespace QuantConnect.Lean.DataSource.KalshiData
             }
 
             return _symbolMapper.GetLeanSymbol(ticker);
+        }
+
+        /// <summary>
+        /// Create both YES and NO token symbols for a Kalshi market ticker
+        /// </summary>
+        public (Symbol yes, Symbol no) CreateTokenSymbols(string ticker)
+        {
+            if (_symbolMapper == null)
+            {
+                throw new InvalidOperationException("Provider not initialized");
+            }
+
+            return _symbolMapper.GetLeanTokenSymbols(ticker);
         }
 
         #endregion

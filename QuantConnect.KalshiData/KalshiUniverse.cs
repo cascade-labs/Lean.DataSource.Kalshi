@@ -244,16 +244,19 @@ namespace QuantConnect.Lean.DataSource.KalshiData
                 }
 
                 // Convert to symbols and register close times/results
+                // Emit both YES and NO tokens for each market
                 foreach (var market in markets)
                 {
-                    var symbol = _dataProvider.CreateSymbol(market.Ticker);
-                    symbols.Add(symbol);
+                    var (yesSymbol, noSymbol) = _dataProvider.SymbolMapper.GetLeanTokenSymbols(market.Ticker);
+                    symbols.Add(yesSymbol);
+                    symbols.Add(noSymbol);
 
-                    // Register close time in the settlement registry
+                    // Register close time in the settlement registry for both tokens
                     var closeTime = ParseIsoTime(market.CloseTime);
                     if (closeTime.HasValue)
                     {
-                        PredictionMarketSettlementRegistry.SetDelistingDate(symbol, closeTime.Value);
+                        PredictionMarketSettlementRegistry.SetDelistingDate(yesSymbol, closeTime.Value);
+                        PredictionMarketSettlementRegistry.SetDelistingDate(noSymbol, closeTime.Value);
                     }
 
                     // Register settlement result if market is settled
@@ -265,7 +268,8 @@ namespace QuantConnect.Lean.DataSource.KalshiData
                             "no" => PredictionMarketSettlementResult.No,
                             _ => PredictionMarketSettlementResult.Pending
                         };
-                        PredictionMarketSettlementRegistry.SetResult(symbol, result);
+                        PredictionMarketSettlementRegistry.SetResult(yesSymbol, result);
+                        PredictionMarketSettlementRegistry.SetResult(noSymbol, result);
                     }
                 }
 

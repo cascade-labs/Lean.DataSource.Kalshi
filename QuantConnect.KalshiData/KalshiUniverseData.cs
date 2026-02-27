@@ -120,11 +120,11 @@ namespace QuantConnect.Lean.DataSource.KalshiData
                 Volume24h = market.Volume24h,
                 OpenInterest = market.OpenInterest,
                 Liquidity = market.Liquidity,
-                OpenTime = !string.IsNullOrEmpty(market.OpenTime)
-                    ? DateTime.Parse(market.OpenTime, null, DateTimeStyles.RoundtripKind)
+                OpenTime = !string.IsNullOrEmpty(market.OpenTime) && DateTime.TryParse(market.OpenTime, null, DateTimeStyles.RoundtripKind, out var ot)
+                    ? ot
                     : null,
-                CloseTime = !string.IsNullOrEmpty(market.CloseTime)
-                    ? DateTime.Parse(market.CloseTime, null, DateTimeStyles.RoundtripKind)
+                CloseTime = !string.IsNullOrEmpty(market.CloseTime) && DateTime.TryParse(market.CloseTime, null, DateTimeStyles.RoundtripKind, out var ct)
+                    ? ct
                     : null,
                 Result = market.Result,
                 StrikeType = market.StrikeType,
@@ -180,8 +180,8 @@ namespace QuantConnect.Lean.DataSource.KalshiData
                 SeriesTicker = csv[2],
                 Category = csv[3],
                 Status = csv[4],
-                OpenTime = string.IsNullOrEmpty(csv[5]) ? null : DateTime.Parse(csv[5], null, DateTimeStyles.RoundtripKind),
-                CloseTime = string.IsNullOrEmpty(csv[6]) ? null : DateTime.Parse(csv[6], null, DateTimeStyles.RoundtripKind),
+                OpenTime = !string.IsNullOrEmpty(csv[5]) && DateTime.TryParse(csv[5], null, DateTimeStyles.RoundtripKind, out var csvOt) ? csvOt : null,
+                CloseTime = !string.IsNullOrEmpty(csv[6]) && DateTime.TryParse(csv[6], null, DateTimeStyles.RoundtripKind, out var csvCt) ? csvCt : null,
                 Result = string.IsNullOrEmpty(csv[7]) ? null : csv[7],
                 YesBid = decimal.Parse(csv[8], CultureInfo.InvariantCulture),
                 YesAsk = decimal.Parse(csv[9], CultureInfo.InvariantCulture),

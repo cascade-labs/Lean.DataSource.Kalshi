@@ -34,7 +34,21 @@ namespace QuantConnect.Lean.DataSource.KalshiData
         }
 
         /// <summary>
-        /// Get the Kalshi market ticker from a LEAN symbol
+        /// Create LEAN Symbols for both YES and NO tokens from a Kalshi market ticker
+        /// </summary>
+        /// <param name="ticker">Kalshi market ticker</param>
+        /// <returns>Tuple of (yes, no) Symbols</returns>
+        public (Symbol yes, Symbol no) GetLeanTokenSymbols(string ticker)
+        {
+            var t = ticker.ToUpperInvariant();
+            var yes = Symbol.CreatePredictionMarketToken(t, KalshiMarket, PredictionMarketTokenType.Yes);
+            var no = Symbol.CreatePredictionMarketToken(t, KalshiMarket, PredictionMarketTokenType.No);
+            return (yes, no);
+        }
+
+        /// <summary>
+        /// Get the Kalshi market ticker from a LEAN symbol.
+        /// Uses SecurityIdentifier to get the base API ticker.
         /// </summary>
         /// <param name="symbol">LEAN Symbol</param>
         /// <returns>Kalshi market ticker</returns>
@@ -45,7 +59,7 @@ namespace QuantConnect.Lean.DataSource.KalshiData
                 throw new ArgumentNullException(nameof(symbol));
             }
 
-            return symbol.Value.ToUpperInvariant();
+            return symbol.BaseTicker.ToUpperInvariant();
         }
 
         /// <summary>
